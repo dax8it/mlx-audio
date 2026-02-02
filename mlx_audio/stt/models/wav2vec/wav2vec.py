@@ -1,6 +1,7 @@
 import inspect
 import json
 import math
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Tuple, Union
@@ -88,7 +89,9 @@ class Wav2Vec2NoLayerNormConvLayer(nn.Module):
         self.activation = nn.GELU()
 
     def __call__(self, hidden_states):
-        hidden_states = self.conv(hidden_states)
+        # conv expects (batch, length, channels) but input is (batch, channels, length)
+        hidden_states = self.conv(hidden_states.swapaxes(-2, -1))
+        hidden_states = hidden_states.swapaxes(-2, -1)
         hidden_states = self.activation(hidden_states)
         return hidden_states
 
@@ -142,8 +145,11 @@ class Wav2Vec2GroupNormConvLayer(nn.Module):
         )
 
     def __call__(self, hidden_states):
-        hidden_states = self.conv(hidden_states)
+        # conv expects (batch, length, channels) but input is (batch, channels, length)
+        hidden_states = self.conv(hidden_states.swapaxes(-2, -1))
         hidden_states = self.layer_norm(hidden_states)
+        # swap back to (batch, channels, length)
+        hidden_states = hidden_states.swapaxes(-2, -1)
         hidden_states = self.activation(hidden_states)
         return hidden_states
 
@@ -526,11 +532,11 @@ class Wav2Vec2Encoder(nn.Module):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-                layer_outputs = layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                )
-                hidden_states = layer_outputs[0]
+            layer_outputs = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+            )
+            hidden_states = layer_outputs[0]
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -594,11 +600,11 @@ class Wav2Vec2EncoderStableLayerNorm(nn.Module):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-                layer_outputs = layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                )
-                hidden_states = layer_outputs[0]
+            layer_outputs = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+            )
+            hidden_states = layer_outputs[0]
 
         hidden_states = self.layer_norm(hidden_states)
 
@@ -714,6 +720,18 @@ class Wav2Vec2Model(nn.Module):
 
     @classmethod
     def from_pretrained(cls, repo_id: str, **kwargs):
+        """
+        Load a pretrained Wav2Vec model.
+
+        .. deprecated::
+            Use `mlx_audio.stt.load()` instead. This method will be removed in a future version.
+        """
+        warnings.warn(
+            "Model.from_pretrained() is deprecated. Use mlx_audio.stt.load() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
         path = fetch_from_hub(repo_id)
 
         if path is None:

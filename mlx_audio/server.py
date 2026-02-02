@@ -1,649 +1,742 @@
+"""Main module for MLX Audio API server.
+
+This module provides a FastAPI-based server for hosting MLX Audio models,
+including Text-to-Speech (TTS), Speech-to-Text (STT), and Speech-to-Speech (S2S) models.
+It offers an OpenAI-compatible API for Audio completions and model management.
+"""
+
 import argparse
-import importlib.util
-import logging
+import asyncio
+import io
+import json
 import os
-import sys
-import tempfile
-import os
-import uuid
+import subprocess
+import time
+import webbrowser
+from dataclasses import asdict, is_dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from urllib.parse import unquote
 
-from dotenv import load_dotenv
-load_dotenv()
-
+import mlx.core as mx
 import numpy as np
-import requests
-import soundfile as sf
 import uvicorn
-from fastapi import FastAPI, Form
+import webrtcvad
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Response,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastrtc import ReplyOnPause, Stream, get_stt_model
-from numpy.typing import NDArray
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-# Import the LLM client abstraction
-from .llm_client import LLMClient, OllamaClient, MlxClient
-
-# Configure logging
-def setup_logging(verbose: bool = False):
-    level = logging.DEBUG if verbose else logging.INFO
-    format_str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    if verbose:
-        format_str = "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s"
-
-    logging.basicConfig(level=level, format=format_str)
-    return logging.getLogger("mlx_audio_server")
+from mlx_audio.audio_io import read as audio_read
+from mlx_audio.audio_io import write as audio_write
+from mlx_audio.utils import load_model
 
 
-# Force Hugging Face to offline mode once at import time
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
+def sanitize_for_json(obj: Any) -> Any:
+    """Recursively sanitize NaN, Infinity, and -Infinity values for JSON serialization."""
+    # Handle dataclasses
+    if is_dataclass(obj) and not isinstance(obj, type):
+        obj = asdict(obj)
 
-logger = setup_logging()  # Will be updated with verbose setting in main()
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_for_json(item) for item in obj]
+    elif isinstance(obj, float):
+        if np.isnan(obj):
+            return None
+        elif np.isinf(obj):
+            return None
+        return obj
+    elif isinstance(obj, np.floating):
+        if np.isnan(obj):
+            return None
+        elif np.isinf(obj):
+            return None
+        return float(obj)
+    else:
+        return obj
 
-from mlx_audio.tts.generate import main as generate_main
 
-# Import from mlx_audio package
-from mlx_audio.tts.utils import load_model
-
-from .tts.audio_player import AudioPlayer
-
-# === LLM chat backend (Ollama) ===
-OLLAMA_BASE = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1").rstrip("/")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi4:latest")
-# System / character prompt for the chat model. Accept either env var name.
-SYSTEM_PROMPT = os.getenv("OLLAMA_SYSTEM_PROMPT") or os.getenv("LLAMA_SYSTEM_PROMPT") or "You are an empathetic concise voice assistant."
+MLX_AUDIO_NUM_WORKERS = os.getenv("MLX_AUDIO_NUM_WORKERS", "2")
 
 
-def get_config(key):
-    return os.getenv(key)
+class ModelProvider:
+    def __init__(self):
+        self.models: Dict[str, Dict[str, Any]] = {}
+        self.lock = asyncio.Lock()
 
+    def load_model(self, model_name: str):
+        if model_name not in self.models:
+            self.models[model_name] = load_model(model_name)
 
-llm_client = None
+        return self.models[model_name]
 
-def setup_llm_client():
-    """Initialize the LLM client based on environment configuration."""
-    global llm_client
-    
-    # Ensure environment variables are loaded
-    llm_provider = os.getenv("LLM_PROVIDER", "OLLAMA")  # Default to OLLAMA
-    mlx_model_path = os.getenv("MLX_LLM_MODEL") or os.getenv("MLX_MODEL")
-    
-    if llm_provider.upper() == "MLX":
-        if not mlx_model_path:
-            logger.error("MLX_LLM_MODEL or MLX_MODEL environment variable not configured")
-            logger.info("Falling back to Ollama LLM")
-            llm_client = OllamaClient()
-            return
-        
-        logger.info(f"Using MLX LLM with model: {mlx_model_path}")
-        llm_client = MlxClient(mlx_model_path)
-        if getattr(llm_client, 'system_prompt', None):
-            preview = llm_client.system_prompt.strip().replace('\n', ' ')
-            logger.info(f"MLX system prompt active (preview): {preview[:120]}{'...' if len(preview) > 120 else ''}")
-        
-    else:  # Default to Ollama
-        logger.info(f"Using Ollama LLM with model: {OLLAMA_MODEL}")
-        llm_client = OllamaClient(OLLAMA_BASE, OLLAMA_MODEL, SYSTEM_PROMPT)
-        if SYSTEM_PROMPT:
-            preview = SYSTEM_PROMPT.strip().replace('\n', ' ')
-            logger.info(f"Ollama system prompt active (preview): {preview[:120]}{'...' if len(preview) > 120 else ''}")
+    async def remove_model(self, model_name: str) -> bool:
+        async with self.lock:
+            if model_name in self.models:
+                del self.models[model_name]
+                return True
+            return False
+
+    async def get_available_models(self):
+        async with self.lock:
+            return list(self.models.keys())
 
 
 app = FastAPI()
 
-# Serve local static assets (e.g., Three.js) at /static
-app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 
-# Ensure models load when uvicorn imports this module
-@app.on_event("startup")
-async def _startup_load_models() -> None:
-    """Load TTS/STT models and LLM client once when the FastAPI app starts."""
-    setup_server()
-    setup_llm_client()
+def int_or_float(value):
 
-# Add CORS middleware to allow requests from the same origin
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins, will be restricted by host binding
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Load the model once on server startup.
-# You can change the model path or pass arguments as needed.
-# For performance, load once globally:
-tts_model = None  # Will be loaded when the server starts
-audio_player = None  # Will be initialized when the server starts
-stt_model = get_stt_model()
-# Make sure the output folder for generated TTS files exists
-# Use an absolute path that's guaranteed to be writable
-OUTPUT_FOLDER = os.path.join(os.path.expanduser("~"), ".mlx_audio", "outputs")
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-logger.debug(f"Using output folder: {OUTPUT_FOLDER}")
-
-
-# Let users override the initial TTS model via environment variable.
-# Provide a sensible fallback (4-bit HF repo) so nothing breaks.
-DEFAULT_MODEL = os.getenv("TTS_DEFAULT_MODEL", "mlx-community/Kokoro-82M-4bit")
-
-
-async def speech_to_speech_handler(
-    audio: tuple[int, NDArray[np.int16]],
-    voice: str,
-    speed: float,
-    model: str = DEFAULT_MODEL,  # make optional – FastRTC may omit it
-):
-    global tts_model, llm_client
-
-    # Log raw parameters for easier debugging
-    logger.info(
-        f"Speech-to-speech raw params: voice={voice} | model={model} | speed={speed}"
-    )
-
-    # Heuristic 1 – argument shift: `voice` actually came in as the numeric speed
-    if isinstance(voice, float):
-        speed, model, voice = voice, speed, model or DEFAULT_MODEL
-
-    else:
-        # Heuristic 2 – mistaken swap detection
-        voice_looks_like_model = any(t in voice for t in ("/", "mlx-community", "Kokoro"))
-        model_looks_like_model = any(t in model for t in ("/", "mlx-community", "Kokoro"))
-
-        # Swap only if *voice* looks like a model path AND *model* does not
-        if voice_looks_like_model and not model_looks_like_model:
-            voice, model = model, voice
-
-    # Final safeguard – if voice still appears to be a model path, use a safe default
-    if any(t in voice for t in ("/", "mlx-community", "Kokoro")):
-        logger.warning(
-            f"Invalid voice '{voice}' detected; falling back to 'af_heart'."
-        )
-        voice = "af_heart"
-
-    if tts_model is None:
-        tts_model = load_model(model)
-
-    # 1) Speech-to-text
-    user_text = stt_model.stt(audio)
-    logger.info(f"STT: '{user_text}'")
-
-    # 2) Chat model reply using the configured LLM client
-    reply_text = llm_client.chat(user_text)
-    logger.info(f"LLM reply: '{reply_text}'")
-
-    # 3) Text-to-speech
-    for segment in tts_model.generate(
-        text=reply_text,
-        voice=voice,
-        speed=speed,
-        verbose=False,
-    ):
-        yield (24_000, np.array(segment.audio, copy=False))
-        yield (24_000, np.zeros(2_400, dtype=np.float32))
-
-
-stream = Stream(
-    ReplyOnPause(speech_to_speech_handler, output_sample_rate=24_000),
-    mode="send-receive",
-    modality="audio",
-)
-stream.mount(app)
-
-
-class SpeechToSpeechArgs(BaseModel):
-    voice: str
-    speed: float
-    model: str
-    webrtc_id: str
-
-
-@app.post("/speech_to_speech_input")
-def speech_to_speech_endpoint(args: SpeechToSpeechArgs):
-    # FastRTC appears to rotate the extra arguments: the handler receives (arg1→ignored, arg2→voice, arg3→speed, arg1→model).
-    # Empirically, sending them as (model, voice, speed) makes the handler receive
-    #   voice = voice,
-    #   speed = speed,
-    #   model = model.
-    stream.set_input(args.webrtc_id, args.model, args.voice, args.speed)
-    return {"status": "success"}
-
-
-@app.post("/tts")
-def tts_endpoint(
-    text: str = Form(...),
-    voice: str = Form("af_heart"),
-    speed: float = Form(1.0),
-    model: str = Form("mlx-community/Kokoro-82M-4bit"),
-):
-    """
-    POST an x-www-form-urlencoded form with 'text' (and optional 'voice', 'speed', and 'model').
-    We run TTS on the text, save the audio in a unique file,
-    and return JSON with the filename so the client can retrieve it.
-    """
-    global tts_model
-
-    if not text.strip():
-        return JSONResponse({"error": "Text is empty"}, status_code=400)
-
-    # Validate speed parameter
     try:
-        speed_float = float(speed)
-        if speed_float < 0.5 or speed_float > 2.0:
-            return JSONResponse(
-                {"error": "Speed must be between 0.5 and 2.0"}, status_code=400
-            )
+        return int(value)
     except ValueError:
-        return JSONResponse({"error": "Invalid speed value"}, status_code=400)
+        try:
+            return float(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{value} is not an int or float")
 
-    # Validate model parameter
-    valid_models = [
-        "mlx-community/Kokoro-82M-4bit",
-        "mlx-community/Kokoro-82M-6bit",
-        "mlx-community/Kokoro-82M-8bit",
-        "mlx-community/Kokoro-82M-bf16",
+
+def calculate_default_workers(workers: int = 2) -> int:
+    if num_workers_env := os.getenv("MLX_AUDIO_NUM_WORKERS"):
+        try:
+            workers = int(num_workers_env)
+        except ValueError:
+            workers = max(1, int(os.cpu_count() * float(num_workers_env)))
+    return workers
+
+
+# Add CORS middleware
+def setup_cors(app: FastAPI, allowed_origins: List[str]):
+    """(Re)configure CORS middleware with the given origins."""
+    # Remove any previously configured CORSMiddleware to avoid duplicates
+    app.user_middleware = [
+        m for m in app.user_middleware if m.cls is not CORSMiddleware
     ]
-    if model not in valid_models:
-        return JSONResponse(
-            {"error": f"Invalid model. Must be one of: {', '.join(valid_models)}"},
-            status_code=400,
-        )
 
-    # Store current model repo_id for comparison
-    current_model_repo_id = (
-        getattr(tts_model, "repo_id", None) if tts_model is not None else None
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
-    # Load the model if it's not loaded or if a different model is requested
-    if tts_model is None or current_model_repo_id != model:
-        try:
-            logger.debug(f"Loading TTS model from {model}")
-            tts_model = load_model(model)
-            logger.debug("TTS model loaded successfully")
-        except Exception as e:
-            logger.error(f"Error loading TTS model: {str(e)}")
-            return JSONResponse(
-                {"error": f"Failed to load model: {str(e)}"}, status_code=500
-            )
 
-    # We'll do something like the code in model.generate() from the TTS library:
-    # Generate the unique filename
-    unique_id = str(uuid.uuid4())
-    filename = f"tts_{unique_id}.wav"
-    output_path = os.path.join(OUTPUT_FOLDER, filename)
+# Apply default CORS configuration when imported. The environment variable
+# ``MLX_AUDIO_ALLOWED_ORIGINS`` can override the allowed origins by providing a
+# comma-separated list. This ensures CORS headers are present even when running
+# ``uvicorn mlx_audio.server:app`` directly.
 
-    logger.debug(
-        f"Generating TTS for text: '{text[:50]}...' with voice: {voice}, speed: {speed_float}, model: {model}"
-    )
-    logger.debug(f"Output file will be: {output_path}")
+allowed_origins_env = os.getenv("MLX_AUDIO_ALLOWED_ORIGINS")
+default_origins = (
+    [origin.strip() for origin in allowed_origins_env.split(",")]
+    if allowed_origins_env
+    else ["*"]
+)
 
-    # We'll use the high-level "model.generate" method:
-    results = tts_model.generate(
-        text=text,
-        voice=voice,
-        speed=speed_float,
-        lang_code=voice[0],
-        verbose=False,
-    )
-
-    # We'll just gather all segments (if any) into a single wav
-    # It's typical for multi-segment text to produce multiple wave segments:
-    audio_arrays = []
-    for segment in results:
-        audio_arrays.append(segment.audio)
-
-    # If no segments, return error
-    if not audio_arrays:
-        logger.error("No audio segments generated")
-        return JSONResponse({"error": "No audio generated"}, status_code=500)
-
-    # Concatenate all segments
-    cat_audio = np.concatenate(audio_arrays, axis=0)
-
-    # Write the audio as a WAV
-    try:
-        sf.write(output_path, cat_audio, 24000)
-        logger.debug(f"Successfully wrote audio file to {output_path}")
-
-        # Verify the file exists
-        if not os.path.exists(output_path):
-            logger.error(f"File was not created at {output_path}")
-            return JSONResponse(
-                {"error": "Failed to create audio file"}, status_code=500
-            )
-
-        # Check file size
-        file_size = os.path.getsize(output_path)
-        logger.debug(f"File size: {file_size} bytes")
-
-        if file_size == 0:
-            logger.error("File was created but is empty")
-            return JSONResponse(
-                {"error": "Generated audio file is empty"}, status_code=500
-            )
-
-    except Exception as e:
-        logger.error(f"Error writing audio file: {str(e)}")
-        return JSONResponse(
-            {"error": f"Failed to save audio: {str(e)}"}, status_code=500
-        )
-
-    return {"filename": filename}
+# Setup CORS
+setup_cors(app, default_origins)
 
 
-@app.get("/audio/{filename}")
-def get_audio_file(filename: str):
-    """
-    Return an audio file from the outputs folder.
-    The user can GET /audio/<filename> to fetch the WAV file.
-    """
-    file_path = os.path.join(OUTPUT_FOLDER, filename)
-    logger.debug(f"Requested audio file: {file_path}")
+# Request schemas for OpenAI-compatible endpoints
+class SpeechRequest(BaseModel):
+    model: str
+    input: str
+    voice: str | None = None
+    speed: float | None = 1.0
+    gender: str | None = "male"
+    pitch: float | None = 1.0
+    lang_code: str | None = "a"
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    temperature: float | None = 0.7
+    top_p: float | None = 0.95
+    top_k: int | None = 40
+    repetition_penalty: float | None = 1.0
+    response_format: str | None = "mp3"
 
-    if not os.path.exists(file_path):
-        logger.error(f"File not found: {file_path}")
-        # List files in the directory to help debug
-        try:
-            files = os.listdir(OUTPUT_FOLDER)
-            logger.debug(f"Files in output directory: {files}")
-        except Exception as e:
-            logger.error(f"Error listing output directory: {str(e)}")
 
-        return JSONResponse({"error": "File not found"}, status_code=404)
-
-    logger.debug(f"Serving audio file: {file_path}")
-    return FileResponse(file_path, media_type="audio/wav")
+# Initialize the ModelProvider
+model_provider = ModelProvider()
 
 
 @app.get("/")
-def root():
+async def root():
+    return {
+        "message": "Welcome to the MLX Audio API server! Visit https://localhost:3000 for the UI."
+    }
+
+
+@app.get("/v1/models")
+async def list_models():
     """
-    Serve the audio_player.html page or a fallback HTML if not found
+    Get list of models - provided in OpenAI API compliant format.
     """
-    try:
-        # Try to find the audio_player.html file in the package
-        static_dir = find_static_dir()
-        audio_player_path = os.path.join(static_dir, "audio_player.html")
-        return FileResponse(audio_player_path)
-    except Exception as e:
-        # If there's an error, return a simple HTML page with error information
-        return HTMLResponse(
-            content=f"""
-            <html>
-                <head><title>MLX-Audio TTS Server</title></head>
-                <body>
-                    <h1>MLX-Audio TTS Server</h1>
-                    <p>The server is running, but the web interface could not be loaded.</p>
-                    <p>Error: {str(e)}</p>
-                    <h2>API Endpoints</h2>
-                    <ul>
-                        <li><code>POST /tts</code> - Generate TTS audio</li>
-                        <li><code>GET /audio/{{filename}}</code> - Retrieve generated audio file</li>
-                    </ul>
-                </body>
-            </html>
-            """,
-            status_code=200,
+    models = await model_provider.get_available_models()
+    models_data = []
+    for model in models:
+        models_data.append(
+            {
+                "id": model,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "system",
+            }
         )
+    return {"object": "list", "data": models_data}
 
 
-def find_static_dir():
-    """Find the static directory containing HTML files."""
-    # Try different methods to find the static directory
-
-    # Method 1: Use importlib.resources (Python 3.9+)
-    try:
-        import importlib.resources as pkg_resources
-
-        static_dir = pkg_resources.files("mlx_audio").joinpath("tts")
-        static_dir_str = str(static_dir)
-        if os.path.exists(static_dir_str):
-            return static_dir_str
-    except (ImportError, AttributeError):
-        pass
-
-    # Method 2: Use importlib_resources (Python 3.8)
-    try:
-        import importlib_resources
-
-        static_dir = importlib_resources.files("mlx_audio").joinpath("tts")
-        static_dir_str = str(static_dir)
-        if os.path.exists(static_dir_str):
-            return static_dir_str
-    except ImportError:
-        pass
-
-    # Method 3: Use pkg_resources
-    try:
-        static_dir_str = pkg_resources.resource_filename("mlx_audio", "tts")
-        if os.path.exists(static_dir_str):
-            return static_dir_str
-    except (ImportError, pkg_resources.DistributionNotFound):
-        pass
-
-    # Method 4: Try to find the module path directly
-    try:
-        module_spec = importlib.util.find_spec("mlx_audio")
-        if module_spec and module_spec.origin:
-            package_dir = os.path.dirname(module_spec.origin)
-            static_dir_str = os.path.join(package_dir, "tts")
-            if os.path.exists(static_dir_str):
-                return static_dir_str
-    except (ImportError, AttributeError):
-        pass
-
-    # Method 5: Look in sys.modules
-    try:
-        if "mlx_audio" in sys.modules:
-            module = sys.modules["mlx_audio"]
-            if hasattr(module, "__file__"):
-                package_dir = os.path.dirname(module.__file__)
-                static_dir_str = os.path.join(package_dir, "tts")
-                if os.path.exists(static_dir_str):
-                    return static_dir_str
-    except Exception:
-        pass
-
-    # If all methods fail, raise an error
-    raise RuntimeError("Could not find static directory")
-
-
-@app.post("/play")
-def play_audio(filename: str = Form(...)):
+@app.post("/v1/models")
+async def add_model(model_name: str):
     """
-    Play audio directly from the server using the AudioPlayer.
-    Expects a filename that exists in the OUTPUT_FOLDER.
+    Add a new model to the API.
+
+    Args:
+        model_name (str): The name of the model to add.
+
+    Returns:
+        dict (dict): A dictionary containing the status of the operation.
     """
-    global audio_player
-
-    if audio_player is None:
-        return JSONResponse({"error": "Audio player not initialized"}, status_code=500)
-
-    file_path = os.path.join(OUTPUT_FOLDER, filename)
-    if not os.path.exists(file_path):
-        return JSONResponse({"error": "File not found"}, status_code=404)
-
-    try:
-        # Load the audio file
-        audio_data, sample_rate = sf.read(file_path)
-
-        # If audio is stereo, convert to mono
-        if len(audio_data.shape) > 1 and audio_data.shape[1] > 1:
-            audio_data = audio_data.mean(axis=1)
-
-        # Queue the audio for playback
-        audio_player.queue_audio(audio_data)
-
-        return {"status": "playing", "filename": filename}
-    except Exception as e:
-        return JSONResponse(
-            {"error": f"Failed to play audio: {str(e)}"}, status_code=500
-        )
+    model_provider.load_model(model_name)
+    return {"status": "success", "message": f"Model {model_name} added successfully"}
 
 
-@app.post("/stop")
-def stop_audio():
+@app.delete("/v1/models")
+async def remove_model(model_name: str):
     """
-    Stop any currently playing audio.
+    Remove a model from the API.
+
+    Args:
+        model_name (str): The name of the model to remove.
+
+    Returns:
+        Response (str): A 204 No Content response if successful.
+
+    Raises:
+        HTTPException (str): If the model is not found.
     """
-    global audio_player
-
-    if audio_player is None:
-        return JSONResponse({"error": "Audio player not initialized"}, status_code=500)
-
-    try:
-        audio_player.stop()
-        return {"status": "stopped"}
-    except Exception as e:
-        return JSONResponse(
-            {"error": f"Failed to stop audio: {str(e)}"}, status_code=500
-        )
+    model_name = unquote(model_name).strip('"')
+    removed = await model_provider.remove_model(model_name)
+    if removed:
+        return Response(status_code=204)  # 204 No Content - successful deletion
+    else:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
 
 
-@app.post("/open_output_folder")
-def open_output_folder():
-    """
-    Open the output folder in the system file explorer (Finder on macOS).
-    This only works when running on localhost for security reasons.
-    """
-    global OUTPUT_FOLDER
-
-    # Check if the request is coming from localhost
-    # Note: In a production environment, you would want to check the request IP
-
-    try:
-        # For macOS (Finder)
-        if sys.platform == "darwin":
-            os.system(f"open {OUTPUT_FOLDER}")
-        # For Windows (Explorer)
-        elif sys.platform == "win32":
-            os.system(f"explorer {OUTPUT_FOLDER}")
-        # For Linux (various file managers)
-        elif sys.platform == "linux":
-            os.system(f"xdg-open {OUTPUT_FOLDER}")
-        else:
-            return JSONResponse(
-                {"error": f"Unsupported platform: {sys.platform}"}, status_code=500
+async def generate_audio(model, payload: SpeechRequest, verbose: bool = False):
+    # Load reference audio if provided
+    ref_audio = payload.ref_audio
+    if ref_audio and isinstance(ref_audio, str):
+        if not os.path.exists(ref_audio):
+            raise HTTPException(
+                status_code=400, detail=f"Reference audio file not found: {ref_audio}"
             )
+        # Import load_audio from generate module
+        from mlx_audio.tts.generate import load_audio
 
-        logger.debug(f"Opened output folder: {OUTPUT_FOLDER}")
-        return {"status": "opened", "path": OUTPUT_FOLDER}
-    except Exception as e:
-        logger.error(f"Error opening output folder: {str(e)}")
-        return JSONResponse(
-            {"error": f"Failed to open output folder: {str(e)}"}, status_code=500
+        # Determine if volume normalization is needed
+        normalize = hasattr(model, "model_type") and model.model_type == "spark"
+
+        ref_audio = load_audio(
+            ref_audio, sample_rate=model.sample_rate, volume_normalize=normalize
         )
 
+    for result in model.generate(
+        payload.input,
+        voice=payload.voice,
+        speed=payload.speed,
+        gender=payload.gender,
+        pitch=payload.pitch,
+        lang_code=payload.lang_code,
+        ref_audio=ref_audio,
+        ref_text=payload.ref_text,
+        temperature=payload.temperature,
+        top_p=payload.top_p,
+        top_k=payload.top_k,
+        repetition_penalty=payload.repetition_penalty,
+    ):
 
-def setup_server():
-    """Setup the server by loading the model and creating the output directory."""
-    global tts_model, audio_player, OUTPUT_FOLDER
+        sample_rate = result.sample_rate
+        buffer = io.BytesIO()
+        audio_write(buffer, result.audio, sample_rate, format=payload.response_format)
+        buffer.seek(0)
+        yield buffer.getvalue()
 
-    # Make sure the output folder for generated TTS files exists
+
+@app.post("/v1/audio/speech")
+async def tts_speech(payload: SpeechRequest):
+    """Generate speech audio following the OpenAI text-to-speech API."""
+    model = model_provider.load_model(payload.model)
+    return StreamingResponse(
+        generate_audio(model, payload),
+        media_type=f"audio/{payload.response_format}",
+        headers={
+            "Content-Disposition": f"attachment; filename=speech.{payload.response_format}"
+        },
+    )
+
+
+@app.post("/v1/audio/transcriptions")
+async def stt_transcriptions(
+    file: UploadFile = File(...),
+    model: str = Form(...),
+    language: Optional[str] = Form(None),
+):
+    """Transcribe audio using an STT model in OpenAI format."""
+    data = await file.read()
+    tmp = io.BytesIO(data)
+    audio, sr = audio_read(tmp, always_2d=False)
+    tmp.close()
+    tmp_path = f"/tmp/{time.time()}.mp3"
+    audio_write(tmp_path, audio, sr)
+
+    stt_model = model_provider.load_model(model)
+    result = stt_model.generate(tmp_path)
+    os.remove(tmp_path)
+    # Sanitize NaN values for JSON serialization
+    return sanitize_for_json(result)
+
+
+@app.websocket("/v1/audio/transcriptions/realtime")
+async def stt_realtime_transcriptions(websocket: WebSocket):
+    """Realtime transcription via WebSocket."""
+    await websocket.accept()
+
     try:
-        os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-        # Test write permissions by creating a test file
-        test_file = os.path.join(OUTPUT_FOLDER, "test_write.txt")
-        with open(test_file, "w") as f:
-            f.write("Test write permissions")
-        os.remove(test_file)
-        logger.debug(f"Output directory {OUTPUT_FOLDER} is writable")
-    except Exception as e:
-        logger.error(f"Error with output directory {OUTPUT_FOLDER}: {str(e)}")
-        # Try to use a fallback directory in /tmp
-        fallback_dir = os.path.join("/tmp", "mlx_audio_outputs")
-        logger.debug(f"Trying fallback directory: {fallback_dir}")
-        try:
-            os.makedirs(fallback_dir, exist_ok=True)
-            OUTPUT_FOLDER = fallback_dir
-            logger.debug(f"Using fallback output directory: {OUTPUT_FOLDER}")
-        except Exception as fallback_error:
-            logger.error(f"Error with fallback directory: {str(fallback_error)}")
+        # Receive initial configuration
+        config = await websocket.receive_json()
+        model_name = config.get(
+            "model", "mlx-community/whisper-large-v3-turbo-asr-fp16"
+        )
+        language = config.get("language", None)
+        sample_rate = config.get("sample_rate", 16000)
 
-    # Load the model if not already loaded
-    if tts_model is None:
-        try:
-            default_model = (
-                "mlx-community/Kokoro-82M-4bit"  # Same default as in tts_endpoint
-            )
-            logger.debug(f"Loading TTS model from {default_model}")
-            tts_model = load_model(default_model)
-            logger.debug("TTS model loaded successfully")
+        print(
+            f"Configuration received: model={model_name}, language={language}, sample_rate={sample_rate}"
+        )
 
-            # Point Kokoro pipeline to local repo dir so it fetches voices from disk
+        # Load the STT model
+        print("Loading STT model...")
+        stt_model = model_provider.load_model(model_name)
+        print("STT model loaded successfully")
+
+        # Initialize WebRTC VAD for speech detection
+        vad = webrtcvad.Vad(
+            3
+        )  # Mode 3 is most aggressive (0-3, higher = more aggressive)
+        # VAD requires specific frame sizes: 10ms, 20ms, or 30ms at 8kHz, 16kHz, 32kHz, or 48kHz
+        vad_frame_duration_ms = 30  # 30ms frames
+        vad_frame_size = int(sample_rate * vad_frame_duration_ms / 1000)
+        print(
+            f"VAD initialized: frame_size={vad_frame_size} samples ({vad_frame_duration_ms}ms at {sample_rate}Hz)"
+        )
+
+        # Buffer for accumulating audio chunks with speech
+        audio_buffer = []
+        min_chunk_size = int(sample_rate * 0.5)  # Minimum 0.5 seconds before processing
+        initial_chunk_size = int(
+            sample_rate * 1.5
+        )  # Process first 1.5 seconds for real-time feedback
+        max_chunk_size = int(
+            sample_rate * 5.0
+        )  # Maximum 10 seconds to avoid memory issues
+        silence_skip_count = 0
+        speech_chunk_count = 0
+        last_speech_time = time.time()  # Track when we last detected speech
+        silence_threshold_seconds = 0.5  # Process when silence > 0.5 seconds
+        last_process_time = time.time()
+        initial_chunk_processed = False  # Track if we've processed the initial chunk
+        processed_samples = 0  # Track how many samples we've already processed
+
+        await websocket.send_json({"status": "ready", "message": "Ready to transcribe"})
+        print("Ready to transcribe")
+
+        while True:
+            # Receive message
             try:
-                local_repo = os.path.join(
-                    os.path.dirname(__file__),
-                    "tts",
-                    "models",
-                    "kokoro",
-                    "Kokoro-82M",
-                )
-                if hasattr(tts_model, "pipeline"):
-                    tts_model.pipeline.repo_id = local_repo
-                    logger.debug(f"Kokoro pipeline repo_id set to local path: {local_repo}")
-            except Exception as patch_err:
-                logger.warning(f"Could not patch pipeline repo path: {patch_err}")
-        except Exception as e:
-            logger.error(f"Error loading TTS model: {str(e)}")
-            raise
+                message = await websocket.receive()
+            except:
+                break
 
-    # Initialize the audio player if not already initialized
-    if audio_player is None:
-        try:
-            logger.debug("Initializing audio player")
-            audio_player = AudioPlayer()
-            logger.debug("Audio player initialized successfully")
-        except Exception as e:
-            logger.error(f"Error initializing audio player: {str(e)}")
+            if "bytes" in message:
+                # Audio data received as int16
+                audio_chunk_int16 = np.frombuffer(message["bytes"], dtype=np.int16)
 
-    # Try to mount the static files directory
-    try:
-        static_dir = find_static_dir()
-        logger.debug(f"Found static directory: {static_dir}")
-        app.mount("/static", StaticFiles(directory=static_dir), name="static")
-        logger.debug("Static files mounted successfully")
+                # Process audio in VAD frame sizes to detect speech
+                # WebRTC VAD requires frames of exactly 10ms, 20ms, or 30ms
+                # at sample rates of 8000, 16000, 32000, or 48000 Hz
+                num_frames = len(audio_chunk_int16) // vad_frame_size
+                has_speech = False
+                speech_frames = 0
+
+                # Check each VAD frame for speech activity
+                for i in range(num_frames):
+                    frame_start = i * vad_frame_size
+                    frame_end = frame_start + vad_frame_size
+                    frame = audio_chunk_int16[frame_start:frame_end]
+
+                    # VAD requires exact frame size
+                    if len(frame) == vad_frame_size:
+                        try:
+                            if vad.is_speech(frame.tobytes(), sample_rate):
+                                has_speech = True
+                                speech_frames += 1
+                        except (ValueError, OSError) as e:
+                            # If VAD fails (wrong sample rate or frame size), assume speech (conservative)
+                            # This can happen if sample rate doesn't match VAD requirements
+                            print(f"VAD error (assuming speech): {e}")
+                            has_speech = True
+                            speech_frames += 1
+
+                # Handle remaining samples that don't form a complete frame
+                # These will be processed in the next chunk
+
+                # Only accumulate audio if it contains speech
+                current_time = time.time()
+                if has_speech:
+                    # Convert to float32 for buffer
+                    audio_chunk_float = audio_chunk_int16.astype(np.float32) / 32768.0
+                    audio_buffer.extend(audio_chunk_float)
+                    speech_chunk_count += 1
+                    silence_skip_count = 0
+                    last_speech_time = current_time
+
+                    if len(audio_buffer) % (sample_rate * 2) < len(audio_chunk_float):
+                        # Log every ~2 seconds of buffer
+                        print(
+                            f"Speech detected ({speech_frames}/{num_frames} frames): buffer {len(audio_buffer)} samples ({len(audio_buffer)/sample_rate:.2f}s)"
+                        )
+                else:
+                    silence_skip_count += 1
+                    # Only log silence periodically to reduce noise
+                    if silence_skip_count % 20 == 0:
+                        print(f"Silence detected: skipped {silence_skip_count} chunks")
+
+                # Determine if we should process:
+                # 1. Process initial chunk (first 1.5s) for real-time feedback while accumulating
+                # 2. If we have silence > 0.5 seconds and buffer has speech (end of utterance)
+                # 3. If buffer reaches maximum size (to avoid memory issues)
+                time_since_last_speech = current_time - last_speech_time
+                should_process_initial = False
+                should_process_final = False
+
+                if len(audio_buffer) > 0:
+                    # Process initial chunk for real-time feedback (only once per speech segment)
+                    if (
+                        not initial_chunk_processed
+                        and len(audio_buffer) >= initial_chunk_size
+                        and has_speech  # Only if we're still detecting speech
+                    ):
+                        should_process_initial = True
+                        print(
+                            f"Processing initial chunk for real-time feedback: {initial_chunk_size/sample_rate:.2f}s, total buffer: {len(audio_buffer)/sample_rate:.2f}s"
+                        )
+                    # Process if we have enough silence after speech (end of utterance)
+                    elif (
+                        time_since_last_speech >= silence_threshold_seconds
+                        and len(audio_buffer) >= min_chunk_size
+                    ):
+                        should_process_final = True
+                        print(
+                            f"Processing due to silence gap: {time_since_last_speech:.2f}s silence, buffer: {len(audio_buffer)/sample_rate:.2f}s"
+                        )
+                    # Or if buffer is getting too large (continuous speech)
+                    elif len(audio_buffer) >= max_chunk_size:
+                        should_process_final = True
+                        print(
+                            f"Processing due to max buffer size: {len(audio_buffer)/sample_rate:.2f}s"
+                        )
+
+                # Process initial chunk for real-time feedback
+                if should_process_initial and len(audio_buffer) >= initial_chunk_size:
+                    process_size = initial_chunk_size
+                    audio_array = np.array(audio_buffer[:process_size])
+                    processed_samples = process_size
+                    initial_chunk_processed = True
+
+                    # Save to temporary file for processing
+                    tmp_path = f"/tmp/realtime_initial_{time.time()}.mp3"
+                    audio_write(tmp_path, audio_array, sample_rate)
+
+                    try:
+                        # Generate transcription for initial chunk
+                        result = stt_model.generate(
+                            tmp_path,
+                            language=(
+                                language if language and language != "Detect" else None
+                            ),
+                            verbose=False,
+                        )
+
+                        print(f"Initial transcription: {result.text[:100]}...")
+
+                        # Send initial transcription result (marked as partial)
+                        segments = (
+                            sanitize_for_json(result.segments)
+                            if hasattr(result, "segments") and result.segments
+                            else None
+                        )
+                        await websocket.send_json(
+                            {
+                                "text": result.text,
+                                "segments": segments,
+                                "language": (
+                                    result.language
+                                    if hasattr(result, "language")
+                                    else language
+                                ),
+                                "is_partial": True,  # Mark as partial for UI
+                            }
+                        )
+
+                    except Exception as e:
+                        import traceback
+
+                        error_msg = str(e)
+                        traceback.print_exc()
+                        print(f"Error during initial transcription: {error_msg}")
+                        await websocket.send_json(
+                            {"error": error_msg, "status": "error"}
+                        )
+                    finally:
+                        # Clean up temp file
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+
+                # Process final chunk (entire accumulated buffer)
+                if should_process_final and len(audio_buffer) > 0:
+                    # Process the entire buffer (continuous speech chunk)
+                    process_size = len(audio_buffer)
+                    audio_array = np.array(audio_buffer)
+
+                    # Save to temporary file for processing
+                    tmp_path = f"/tmp/realtime_{time.time()}.mp3"
+                    audio_write(tmp_path, audio_array, sample_rate)
+
+                    try:
+                        # Generate transcription
+
+                        result = stt_model.generate(
+                            tmp_path,
+                            language=(
+                                language if language and language != "Detect" else None
+                            ),
+                            verbose=False,
+                        )
+
+                        print(f"Transcription result: {result.text[:100]}...")
+
+                        # Send final transcription result (complete utterance)
+                        segments = (
+                            sanitize_for_json(result.segments)
+                            if hasattr(result, "segments") and result.segments
+                            else None
+                        )
+                        await websocket.send_json(
+                            {
+                                "text": result.text,
+                                "segments": segments,
+                                "language": (
+                                    result.language
+                                    if hasattr(result, "language")
+                                    else language
+                                ),
+                                "is_partial": False,  # Mark as final/complete
+                            }
+                        )
+
+                        # Clear processed audio from buffer and reset state
+                        audio_buffer = []
+                        processed_samples = 0
+                        initial_chunk_processed = False
+                        last_process_time = current_time
+                        print(
+                            f"Processed final chunk: {process_size} samples ({process_size/sample_rate:.2f}s), buffer cleared"
+                        )
+
+                    except Exception as e:
+                        import traceback
+
+                        error_msg = str(e)
+                        traceback.print_exc()
+                        print(f"Error during transcription: {error_msg}")
+                        await websocket.send_json(
+                            {"error": error_msg, "status": "error"}
+                        )
+                    finally:
+                        # Clean up temp file
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+
+            elif "text" in message:
+                # JSON message received (e.g., stop command)
+                try:
+                    data = json.loads(message["text"])
+                    if data.get("action") == "stop":
+                        break
+                except:
+                    pass
+
+    except WebSocketDisconnect:
+        pass
     except Exception as e:
-        logger.error(f"Could not mount static files directory: {e}")
-        logger.warning(
-            "The server will still function, but the web interface may be limited."
-        )
+        try:
+            await websocket.send_json({"error": str(e), "status": "error"})
+        except:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
 
 
-def main(host="127.0.0.1", port=8000, verbose=False):
-    """Parse command line arguments for the server and start it."""
-    parser = argparse.ArgumentParser(description="Start the MLX-Audio TTS server")
+class MLXAudioStudioServer:
+    def __init__(self, start_ui=False, log_dir="logs"):
+        self.start_ui = start_ui
+        self.ui_process = None
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(exist_ok=True)
+
+    def start_ui_background(self):
+        """Start UI with logs redirected to file"""
+        ui_path = Path(__file__).parent / "ui"
+
+        try:
+            # Install deps silently
+            result = subprocess.run(
+                ["npm", "install"],
+                cwd=str(ui_path),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+        except FileNotFoundError:
+            raise Exception(
+                "✗ Error: 'npm' is not installed or not found in PATH. UI will not start."
+            )
+        except subprocess.CalledProcessError as e:
+            raise Exception("✗ Error running 'npm install':\n", e)
+
+        try:
+            # Start UI with logs to file
+            ui_log = open(self.log_dir / "ui.log", "w")
+            self.ui_process = subprocess.Popen(
+                ["npm", "run", "dev"],
+                cwd=str(ui_path),
+                stdout=ui_log,
+                stderr=subprocess.STDOUT,
+            )
+            print(f"✓ UI started (logs: {self.log_dir}/ui.log)")
+        except FileNotFoundError:
+            raise Exception(
+                "✗ Error: 'npm' is not installed or not found in PATH. UI server not started."
+            )
+        except Exception as e:
+            raise Exception(f"✗ Failed to start UI: {e}")
+
+    def start_server(self, host="localhost", port=8000, reload=False, workers=2):
+        if self.start_ui:
+            self.start_ui_background()
+            time.sleep(2)
+            webbrowser.open("http://localhost:3000")
+            print(f"✓ API server starting on http://{host}:{port}")
+            print(f"✓ Studio UI available at http://localhost:3000")
+            print("\nPress Ctrl+C to stop both servers")
+
+        try:
+            uvicorn.run(
+                "mlx_audio.server:app",
+                host=host,
+                port=port,
+                reload=reload,
+                workers=workers,
+                loop="asyncio",
+            )
+        finally:
+            if self.ui_process:
+                self.ui_process.terminate()
+                print("✓ UI server stopped")
+
+            ui_log_path = self.log_dir / "ui.log"
+            if ui_log_path.exists():
+                ui_log_path.unlink()
+                print(f"✓ UI logs deleted from {ui_log_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MLX Audio API server")
     parser.add_argument(
-        "--host",
-        type=str,
-        default="127.0.0.1",
-        help="Host address to bind the server to (default: 127.0.0.1)",
+        "--allowed-origins",
+        nargs="+",
+        default=["*"],
+        help="List of allowed origins for CORS",
     )
     parser.add_argument(
-        "--port",
-        type=int,
-        default=8000,
-        help="Port to bind the server to (default: 8000)",
+        "--host", type=str, default="localhost", help="Host to run the server on"
     )
     parser.add_argument(
-        "--verbose",
+        "--port", type=int, default=8000, help="Port to run the server on"
+    )
+    parser.add_argument(
+        "--reload",
+        type=bool,
+        default=False,
+        help="Enable auto-reload of the server. Only works when 'workers' is set to None.",
+    )
+
+    parser.add_argument(
+        "--workers",
+        type=int_or_float,
+        default=calculate_default_workers(),
+        help="""Number of workers. Overrides the `MLX_AUDIO_NUM_WORKERS` env variable.
+        Can be either an int or a float.
+        If an int, it will be the number of workers to use.
+        If a float, number of workers will be this fraction of the  number of CPU cores available, with a minimum of 1.
+        Defaults to the `MLX_AUDIO_NUM_WORKERS` env variable if set and to 2 if not.
+        To use all available CPU cores, set it to 1.0.
+
+        Examples:
+        --workers 1 (will use 1 worker)
+        --workers 1.0 (will use all available CPU cores)
+        --workers 0.5 (will use half the number of CPU cores available)
+        --workers 0.0 (will use 1 worker)""",
+    )
+    parser.add_argument(
+        "--start-ui",
         action="store_true",
-        help="Enable verbose logging with detailed debug information",
+        help="Start the Studio UI alongside the API server",
     )
+    parser.add_argument(
+        "--log-dir",
+        type=str,
+        default="logs",
+        help="Directory to save server logs",
+    )
+
     args = parser.parse_args()
+    if isinstance(args.workers, float):
+        args.workers = max(1, int(os.cpu_count() * args.workers))
 
-    # Update logger with verbose setting
-    global logger
-    logger = setup_logging(args.verbose)
+    setup_cors(app, args.allowed_origins)
 
-    # Start the server with the parsed arguments
-    setup_server()
-    uvicorn.run(
-        app,
+    client = MLXAudioStudioServer(start_ui=args.start_ui, log_dir=args.log_dir)
+    client.start_server(
         host=args.host,
         port=args.port,
-        log_level="debug" if args.verbose else "info",
+        reload=args.reload if args.workers is None else False,
+        workers=args.workers,
     )
 
 
