@@ -45,3 +45,12 @@ output/
 .build
 claude.md
 .claude/
+# Local notes / artifacts
+findings.md
+progress.md
+task_plan.md
+offline_test_000.wav
+
+# Local test outputs / caches
+mlx_audio/offline_chat/
+mlx_audio/stt/models/
